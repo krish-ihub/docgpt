@@ -1,0 +1,123 @@
+import OpenAI from 'openai'; 
+import dotenv from 'dotenv';
+import axios from 'axios';
+import fs from 'fs'; 
+
+dotenv.config(); 
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Initialize conversation history in memory
+const conversationHistory = {}; // Store history by session or user
+
+const initializeSessionHistory = (sessionId) => {
+    if (!conversationHistory[sessionId]) {
+        conversationHistory[sessionId] = [];
+    }
+};
+
+// Function to upload a JSON file and create a vector store
+const uploadJsonFileAndCreateVectorStore = async (filePath) => {
+    try {
+        const vectorStore = await client.beta.vector_stores.create({ name: "Knowledge Vector Store" });
+        const fileStream = fs.createReadStream(filePath);
+
+        const fileBatch = await client.beta.vector_stores.file_batches.upload_and_poll(
+            vectorStore.id,
+            [fileStream]
+        );
+
+        return vectorStore.id;
+    } catch (error) {
+        console.error('Error uploading JSON file:', error);
+        throw error;
+    }
+};
+
+// Function to update the assistant to use the vector store
+const updateAssistantWithVectorStore = async (assistantId, vectorStoreId) => {
+    try {
+        await client.beta.assistants.update(assistantId, {
+            tool_resources: {
+                file_search: { vector_store_ids: [vectorStoreId] },
+            },
+        });
+    } catch (error) {
+        console.error('Error updating assistant:', error);
+        throw error;
+    }
+};
+
+// Function to handle chat interaction with context
+export const handleChat = async (req, res) => {
+    const { query, sessionId } = req.body;
+    const assistantId = process.env.ASSISTANT_ID;
+
+    try {
+        initializeSessionHistory(sessionId);  // Ensure conversation history for the session exists
+
+        const assistantResponse = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+                'OpenAI-Beta': 'assistants=v2',
+            },
+        });
+
+        const assistantData = assistantResponse.data;
+
+        // Add new user query to conversation history
+        conversationHistory[sessionId].push({ role: 'user', content: query });
+
+        // Limit messages to avoid exceeding token limit
+        if (conversationHistory[sessionId].length > 20) {
+            conversationHistory[sessionId].shift(); // Remove the oldest message if over limit
+        }
+
+        // Create completion with message history
+        const response = await client.chat.completions.create({
+            model: assistantData.model,
+            messages: [
+                { 
+                    role: 'system', 
+                    content: `Your name is DocGPT. You are tasked with diagnosing possible conditions based on the user's reported symptoms, using the provided dataset to retrieve relevant information.
+                    Instructions
+                    Understand the User's Symptoms: Review each symptom the user mentions to determine what condition(s) they may have.
+                    Ask Follow-up Questions: Based on initial symptoms, ask one focused question at a time to gather further details.
+                    Use File Search: Retrieve relevant content from the dataset file for accurate diagnoses.
+                    Provide Clear Feedback: After gathering enough symptoms, provide a concise, aesthetically simple diagnosis.
+                    Response Style
+                    Concise and Aesthetic: Avoid long paragraphs. Keep responses simple, asking one question per message.
+                    Empathetic and Professional: Keep a supportive tone and provide clear guidance.
+                    When Uncertain: If more information is needed, ask another question based on common indicators related to the symptoms.`
+               
+                },
+                ...conversationHistory[sessionId]
+            ],
+            temperature: assistantData.temperature || 1.0,
+            top_p: assistantData.top_p || 1.0,
+        });
+
+        // Capture assistant's response and add to conversation history
+        const assistantMessage = response.choices[0].message.content;
+        conversationHistory[sessionId].push({ role: 'assistant', content: assistantMessage });
+
+        res.json(assistantMessage);
+    } catch (error) {
+        console.error('Error communicating with OpenAI:', error.response ? error.response.data : error.message);
+        res.status(500).json({
+            message: 'Error communicating with OpenAI',
+            error: error.response ? error.response.data : error.message,
+        });
+    }
+};
+
+// Function to set up the assistant and upload the file
+export const setupAssistant = async (filePath) => {
+    try {
+        const assistantId = process.env.ASSISTANT_ID;
+        const vectorStoreId = await uploadJsonFileAndCreateVectorStore(filePath);
+        await updateAssistantWithVectorStore(assistantId, vectorStoreId);
+    } catch (error) {
+        console.error('Error during setup:', error);
+    }
+};
